@@ -424,12 +424,20 @@ class SalesforceBulk(object):
         resp = requests.get(uri, headers=self.headers())
         if resp.status_code != 200:
             return False
-
-        tree = ET.fromstring(resp.content)
-        find_func = getattr(tree, 'iterfind', tree.findall)
-        return [str(r.text) for r in
-                find_func("{{{0}}}result".format(self.jobNS))]
-
+        
+        # parse the results depending on the results
+        if resp.headers['Content-Type'] == 'text/csv':
+            # parse the results as CSV
+            file_handler = StringIO.StringIO(resp.content)
+            reader = csv.DictReader(file_handler, delimiter=',')
+            return [r['Id'] for r in reader]
+        else:
+            # default: use XML
+            tree = ET.fromstring(resp.content)
+            find_func = getattr(tree, 'iterfind', tree.findall)
+            return [str(r.text) for r in
+                    find_func("{{{0}}}result".format(self.jobNS))]
+        
     def get_all_results_for_batch(self, batch_id, job_id=None, parse_csv=False, logger=None):
         """
         Gets result ids and generates each result set from the batch and returns it
