@@ -14,6 +14,8 @@ import StringIO
 import re
 import time
 import csv
+import logging
+import json
 
 from . import bulk_states
 
@@ -47,6 +49,13 @@ class BulkBatchFailed(BulkApiError):
                                                             state_message)
         super(BulkBatchFailed, self).__init__(message)
 
+class BulkBatchTimeout(BulkApiError):
+
+    def __init__(self, job_id, batch_id, message):
+        self.job_id = job_id
+        self.batch_id = batch_id
+        super(BulkBatchTimeout, self).__init__(message)
+
 
 class SalesforceBulk(object):
 
@@ -72,6 +81,7 @@ class SalesforceBulk(object):
         self.batches = {}  # dict of batch_id => job_id
         self.batch_statuses = {}
         self.exception_class = exception_class
+        self.logger = logging.getLogger('SalesforceBulk')
 
     @staticmethod
     def login_to_salesforce(username, password, sandbox=False):
@@ -296,7 +306,7 @@ class SalesforceBulk(object):
 
         if resp.status_code >= 400:
             self.raise_error(content, resp.status_code)
-
+        self.logger.debug(content)
         tree = ET.fromstring(content)
         batch_id = tree.findtext("{%s}id" % self.jobNS)
         return batch_id
@@ -306,7 +316,11 @@ class SalesforceBulk(object):
         query_job_id = self.create_query_job(object_type)
         soql = "Select Id from %s where %s Limit 10000" % (object_type, where)
         query_batch_id = self.query(query_job_id, soql)
-        self.wait_for_batch(query_job_id, query_batch_id, timeout=120)
+        try:
+            self.wait_for_batch(query_job_id, query_batch_id, timeout=120)
+        except BulkBatchTimeout, e:
+            # log it and move on
+            self.logger.exception(e)
 
         results = []
 
@@ -378,8 +392,11 @@ class SalesforceBulk(object):
         uri = self.endpoint + \
             "/job/%s/batch/%s" % (job_id, batch_id)
         resp, content = http.request(uri, headers=self.headers())
+
+        self.logger.debug(content)
         self.check_status(resp, content)
 
+        # TODO: it appears that this always returns XML
         tree = ET.fromstring(content)
         result = {}
         for child in tree:
@@ -410,11 +427,25 @@ class SalesforceBulk(object):
         while not self.is_batch_done(job_id, batch_id) and waited < timeout:
             time.sleep(sleep_interval)
             waited += sleep_interval
+        if waited >= timeout:
+            # raise an exception?
+            raise BulkBatchTimeout(job_id, batch_id, "batch did not complete by timeout={}".format(timeout))
 
-    def get_batch_result_ids(self, batch_id, job_id=None):
+
+    def get_batch_results(self, batch_id, job_id=None):
+        """
+        returns a generator to parse the results for the given batch and job
+
+        Params:
+            batch_id (string): the id of the batch
+            job_id (string): the id of the job. If not passed in, will look up the job_id for the given batch
+
+        Returns:
+            generator: yields each row in the batch response
+        """
         job_id = job_id or self.lookup_job_id(batch_id)
         if not self.is_batch_done(job_id, batch_id):
-            return False
+            return
 
         uri = urlparse.urljoin(
             self.endpoint + "/",
@@ -423,175 +454,38 @@ class SalesforceBulk(object):
         )
         resp = requests.get(uri, headers=self.headers())
         if resp.status_code != 200:
-            return False
-        
-        # parse the results depending on the results
-        if resp.headers['Content-Type'] == 'text/csv':
+            # raise exception?
+            return
+
+        for result in self._parse_batch_result(resp):
+            yield result
+
+    def _parse_batch_result(self, response):
+        """
+        return a generator to parse the given http response
+
+        Returns:
+            generator: returns each row in the response content
+
+        """
+        if response == None or response.status_code != 200:
+            # raise exception?
+            return
+
+        if response.headers['Content-Type'] == 'text/csv':
             # parse the results as CSV
-            file_handler = StringIO.StringIO(resp.content)
+            file_handler = StringIO.StringIO(response.content)
             reader = csv.DictReader(file_handler, delimiter=',')
-            return [r['Id'] for r in reader]
+            for row in reader:
+                yield row
+        elif response.headers['Content-Type'] == 'text/json':
+            obj = json.loads(response.content)
+            for row in obj:
+                yield row
         else:
             # default: use XML
-            tree = ET.fromstring(resp.content)
+            tree = ET.fromstring(response.content)
             find_func = getattr(tree, 'iterfind', tree.findall)
-            return [str(r.text) for r in
-                    find_func("{{{0}}}result".format(self.jobNS))]
-        
-    def get_all_results_for_batch(self, batch_id, job_id=None, parse_csv=False, logger=None):
-        """
-        Gets result ids and generates each result set from the batch and returns it
-        as an generator fetching the next result set when needed
+            for r in find_func("{{{0}}}result".format(self.jobNS)):
+                yield r
 
-        Args:
-            batch_id: id of batch
-            job_id: id of job, if not provided, it will be looked up
-            parse_csv: if true, results will be dictionaries instead of lines
-        """
-        result_ids = self.get_batch_result_ids(batch_id, job_id=job_id)
-        if not result_ids:
-            if logger:
-                logger.error('Batch is not complete, may have timed out. '
-                             'batch_id: %s, job_id: %s', batch_id, job_id)
-            raise RuntimeError('Batch is not complete')
-        for result_id in result_ids:
-            yield self.get_batch_results(
-                batch_id,
-                result_id,
-                job_id=job_id,
-                parse_csv=parse_csv)
-
-    def get_batch_results(self, batch_id, result_id, job_id=None,
-                          parse_csv=False, logger=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-        logger = logger or (lambda message: None)
-
-        uri = urlparse.urljoin(
-            self.endpoint + "/",
-            "job/{0}/batch/{1}/result/{2}".format(
-                job_id, batch_id, result_id),
-        )
-        logger('Downloading bulk result file id=#{0}'.format(result_id))
-        resp = requests.get(uri, headers=self.headers(), stream=True)
-
-        if not parse_csv:
-            iterator = resp.iter_lines()
-        else:
-            iterator = csv.reader(resp.iter_lines(), delimiter=',',
-                                  quotechar='"')
-
-        BATCH_SIZE = 5000
-        for i, line in enumerate(iterator):
-            if i % BATCH_SIZE == 0:
-                logger('Loading bulk result #{0}'.format(i))
-            yield line
-
-    def get_batch_result_iter(self, job_id, batch_id, parse_csv=False,
-                              logger=None):
-        """
-        Return a line interator over the contents of a batch result document. If
-        csv=True then parses the first line as the csv header and the iterator
-        returns dicts.
-        """
-        status = self.batch_status(job_id, batch_id)
-        if status['state'] != 'Completed':
-            return None
-        elif logger:
-            if 'numberRecordsProcessed' in status:
-                logger("Bulk batch %d processed %s records" %
-                       (batch_id, status['numberRecordsProcessed']))
-            if 'numberRecordsFailed' in status:
-                failed = int(status['numberRecordsFailed'])
-                if failed > 0:
-                    logger("Bulk batch %d had %d failed records" %
-                           (batch_id, failed))
-
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result" % (job_id, batch_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
-
-        result_id = r.text.split("<result>")[1].split("</result>")[0]
-
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result/%s" % (job_id, batch_id, result_id)
-        r = requests.get(uri, headers=self.headers(), stream=True)
-
-        if parse_csv:
-            return csv.DictReader(r.iter_lines(chunk_size=2048), delimiter=",",
-                                  quotechar='"')
-        else:
-            return r.iter_lines(chunk_size=2048)
-
-    def get_upload_results(self, job_id, batch_id,
-                           callback=(lambda *args, **kwargs: None),
-                           batch_size=0, logger=None):
-        job_id = job_id or self.lookup_job_id(batch_id)
-
-        if not self.is_batch_done(job_id, batch_id):
-            return False
-        http = Http()
-        uri = self.endpoint + \
-            "/job/%s/batch/%s/result" % (job_id, batch_id)
-        resp, content = http.request(uri, method="GET", headers=self.headers())
-
-        tf = TemporaryFile()
-        tf.write(content)
-
-        total_remaining = self.count_file_lines(tf)
-        if logger:
-            logger("Total records: %d" % total_remaining)
-        tf.seek(0)
-
-        records = []
-        line_number = 0
-        col_names = []
-        reader = csv.reader(tf, delimiter=",", quotechar='"')
-        for row in reader:
-            line_number += 1
-            records.append(UploadResult(*row))
-            if len(records) == 1:
-                col_names = records[0]
-            if batch_size > 0 and len(records) >= (batch_size + 1):
-                callback(records, total_remaining, line_number)
-                total_remaining -= (len(records) - 1)
-                records = [col_names]
-        callback(records, total_remaining, line_number)
-
-        tf.close()
-
-        return True
-
-    def parse_csv(self, tf, callback, batch_size, total_remaining):
-        records = []
-        line_number = 0
-        col_names = []
-        reader = csv.reader(tf, delimiter=",", quotechar='"')
-        for row in reader:
-            line_number += 1
-            records.append(row)
-            if len(records) == 1:
-                col_names = records[0]
-            if batch_size > 0 and len(records) >= (batch_size + 1):
-                callback(records, total_remaining, line_number)
-                total_remaining -= (len(records) - 1)
-                records = [col_names]
-        return records, total_remaining
-
-    def count_file_lines(self, tf):
-        tf.seek(0)
-        buffer = bytearray(2048)
-        lines = 0
-
-        quotes = 0
-        while tf.readinto(buffer) > 0:
-            quoteChar = ord('"')
-            newline = ord('\n')
-            for c in buffer:
-                if c == quoteChar:
-                    quotes += 1
-                elif c == newline:
-                    if (quotes % 2) == 0:
-                        lines += 1
-                        quotes = 0
-
-        return lines
