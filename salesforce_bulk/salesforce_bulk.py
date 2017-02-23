@@ -14,6 +14,7 @@ import StringIO
 import re
 import time
 import csv
+import logging
 
 from . import bulk_states
 
@@ -47,6 +48,13 @@ class BulkBatchFailed(BulkApiError):
                                                             state_message)
         super(BulkBatchFailed, self).__init__(message)
 
+class BulkBatchTimeout(BulkApiError):
+
+    def __init__(self, job_id, batch_id, message):
+        self.job_id = job_id
+        self.batch_id = batch_id
+        super(BulkBatchTimeout, self).__init__(message)
+
 
 class SalesforceBulk(object):
 
@@ -72,6 +80,7 @@ class SalesforceBulk(object):
         self.batches = {}  # dict of batch_id => job_id
         self.batch_statuses = {}
         self.exception_class = exception_class
+        self.logger = logging.getLogger('SalesforceBulk')
 
     @staticmethod
     def login_to_salesforce(username, password, sandbox=False):
@@ -267,7 +276,7 @@ class SalesforceBulk(object):
         for batch in batches:
             resp = requests.post(uri, data=batch, headers=headers)
             content = resp.content
-
+            self.logger.debug(content)
             if resp.status_code >= 400:
                 self.raise_error(content, resp.status)
 
@@ -306,6 +315,13 @@ class SalesforceBulk(object):
         query_job_id = self.create_query_job(object_type)
         soql = "Select Id from %s where %s Limit 10000" % (object_type, where)
         query_batch_id = self.query(query_job_id, soql)
+
+        try:
+            self.wait_for_batch(query_job_id, query_batch_id, timeout=120)
+        except BulkBatchTimeout, e:
+            # log it and move on
+            self.logger.exception(e)
+
         self.wait_for_batch(query_job_id, query_batch_id, timeout=120)
 
         results = []
@@ -410,6 +426,10 @@ class SalesforceBulk(object):
         while not self.is_batch_done(job_id, batch_id) and waited < timeout:
             time.sleep(sleep_interval)
             waited += sleep_interval
+        if waited >= timeout:
+            # raise an exception?
+            raise BulkBatchTimeout(job_id, batch_id, "batch did not complete by timeout={}".format(timeout))
+
 
     def get_batch_result_ids(self, batch_id, job_id=None):
         job_id = job_id or self.lookup_job_id(batch_id)
@@ -595,3 +615,56 @@ class SalesforceBulk(object):
                         quotes = 0
 
         return lines
+
+    def get_batch_status_iter(self, batch_id, job_id=None):
+        """
+        returns a generator to parse the results for the given batch and job
+        Params:
+            batch_id (string): the id of the batch
+            job_id (string): the id of the job. If not passed in, will look up the job_id for the given batch
+        Returns:
+            generator: yields each row in the batch response
+        """
+        job_id = job_id or self.lookup_job_id(batch_id)
+        if not self.is_batch_done(job_id, batch_id):
+            return
+
+        uri = urlparse.urljoin(
+            self.endpoint + "/",
+            "job/{0}/batch/{1}/result".format(
+                job_id, batch_id),
+        )
+        resp = requests.get(uri, headers=self.headers())
+        if resp.status_code != 200:
+            # raise exception?
+            return
+
+        for result in self._parse_batch_result(resp):
+            yield result
+
+    def _parse_batch_result(self, response):
+        """
+        return a generator to parse the given http response
+        Returns:
+            generator: returns each row in the response content
+        """
+        if response == None or response.status_code != 200:
+            # raise exception?
+            return
+
+        if response.headers['Content-Type'] == 'text/csv':
+            # parse the results as CSV
+            file_handler = StringIO.StringIO(response.content)
+            reader = csv.DictReader(file_handler, delimiter=',')
+            for row in reader:
+                yield row
+        elif response.headers['Content-Type'] == 'text/json':
+            obj = json.loads(response.content)
+            for row in obj:
+                yield row
+        else:
+            # default: use XML
+            tree = ET.fromstring(response.content)
+            find_func = getattr(tree, 'iterfind', tree.findall)
+            for r in find_func("{{{0}}}result".format(self.jobNS)):
+                yield r
